@@ -84,8 +84,8 @@ int main(int argc, char** argv) {
         return -2;
     }
 
-    if (message.size() > 140) {
-        fprintf(stderr, "Invalid message: size > 140\n");
+    if (message.size() > GGWave::kMaxLengthVariable) {
+        fprintf(stderr, "Invalid message: size > %d\n", GGWave::kMaxLengthVariable);
         return -3;
     }
 

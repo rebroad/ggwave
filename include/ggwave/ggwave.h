@@ -429,8 +429,8 @@ public:
     static constexpr auto kDefaultMarkerFrames         = 16;
     static constexpr auto kDefaultEncodedDataOffset    = 3;
     static constexpr auto kMaxSamplesPerFrame          = 1024;
-    static constexpr auto kMaxDataSize                 = 256;
-    static constexpr auto kMaxLengthVariable           = 140;
+    static constexpr auto kMaxDataSize                 = 1024;  // Increased to handle 600 chars + ECC
+    static constexpr auto kMaxLengthVariable           = 600;   // Increased to 600 as requested
     static constexpr auto kMaxLengthFixed              = 64;
     static constexpr auto kMaxSpectrumHistory          = 4;
     static constexpr auto kMaxRecordedFrames           = 2048;
