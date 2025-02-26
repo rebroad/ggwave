@@ -19,7 +19,7 @@ except ImportError:
     print("ggwave Python module not found, falling back to ggwave-to-file binary")
 
 # Constants
-CHUNK_SIZE = 600  # Max characters per chunk (600 as requested)
+CHUNK_SIZE = 140  # Max characters per chunk (600 as requested)
 
 # Protocol descriptions
 PROTOCOLS = [
