@@ -2,17 +2,24 @@
 
 import os
 import sys
-import subprocess
 import argparse
 import tempfile
 import wave
 import time
-import json
-import re
+import subprocess
+import numpy as np
+
+# Try to import ggwave, but don't fail if it's not available
+USE_GGWAVE_MODULE = False
+try:
+    import ggwave
+    USE_GGWAVE_MODULE = True
+    print("Using ggwave Python module")
+except ImportError:
+    print("ggwave Python module not found, falling back to ggwave-to-file binary")
 
 # Constants
-CHUNK_SIZE = 600  # Max characters per chunk (must match GGWave::kMaxLengthVariable in ggwave.h)
-PAUSE_SECONDS = 1.0  # Pause duration between chunks in seconds
+CHUNK_SIZE = 600  # Max characters per chunk (600 as requested)
 
 # Protocol descriptions
 PROTOCOLS = [
@@ -56,86 +63,160 @@ def split_message(message, chunk_size=CHUNK_SIZE):
 
     return chunks
 
-def generate_wav_for_chunk(chunk, output_file, protocol=1, volume=50, sample_rate=48000, quiet=False):
-    """Generate a WAV file for a single chunk using ggwave-to-file."""
+def find_ggwave_binary():
+    """Find the ggwave-to-file binary in standard locations."""
+    potential_paths = [
+        './bin/ggwave-to-file',                          # Current directory
+        '../bin/ggwave-to-file',                         # Parent directory
+        '../../bin/ggwave-to-file',                      # Grandparent directory
+        '../../build/bin/ggwave-to-file',                # Build directory
+        '/usr/local/bin/ggwave-to-file',                 # System install
+        os.path.expanduser('~/src/ggwave/build/bin/ggwave-to-file')  # Home directory
+    ]
+
+    for path in potential_paths:
+        if os.path.exists(path) and os.access(path, os.X_OK):
+            return path
+
+    return None
+
+def generate_wav_for_chunk_with_binary(chunk, output_file, protocol=5, volume=50, sample_rate=48000, quiet=False):
+    """Generate a WAV file for a chunk using ggwave-to-file binary."""
+    
+    if not quiet:
+        print(f"  Processing chunk with {len(chunk)} characters using binary")
 
     try:
-        # Always print diagnostic info for debugging
-        print(f"DEBUG: Chunk length: {len(chunk)} characters, {len(chunk.encode('utf-8'))} bytes")
-
-        # Create a temporary file for the chunk data
-        with tempfile.NamedTemporaryFile(mode='w+', encoding='utf-8', delete=False) as tmp:
-            tmp.write(chunk)
-            tmp_name = tmp.name
-
-        print(f"DEBUG: Wrote chunk to temporary file: {tmp_name}")
-
         # Find ggwave-to-file binary
-        # Look in multiple potential locations
-        potential_paths = [
-            './bin/ggwave-to-file',                          # Current directory
-            '../bin/ggwave-to-file',                         # Parent directory
-            '../../bin/ggwave-to-file',                      # Grandparent directory
-            '../../build/bin/ggwave-to-file',                # Build directory
-            '/usr/local/bin/ggwave-to-file',                 # System install
-            os.path.expanduser('~/src/ggwave/build/bin/ggwave-to-file')  # Home directory
-        ]
-
-        ggwave_bin = None
-        for path in potential_paths:
-            if os.path.exists(path) and os.access(path, os.X_OK):
-                ggwave_bin = path
-                break
-
+        ggwave_bin = find_ggwave_binary()
+        
         if not ggwave_bin:
             print("ERROR: Could not find ggwave-to-file binary. Please ensure it's installed and in PATH.")
             return False
 
-        # Run ggwave-to-file with a simple, direct approach
-        cmd = [
-            ggwave_bin,
-            f'-f{output_file}',
-            f'-p{protocol}',
-            f'-v{volume}',
-            f'-s{sample_rate}'
-        ]
+        # Create a temporary file for the input
+        with tempfile.NamedTemporaryFile(mode='w+', delete=False) as tmp:
+            tmp.write(chunk)
+            tmp_path = tmp.name
 
-        print(f"DEBUG: Running command: {' '.join(cmd)}")
+        # Run ggwave-to-file with the chunk
+        cmd = f"{ggwave_bin} -f{output_file} -p{protocol} -v{volume} -s{sample_rate} < {tmp_path}"
 
-        # First, let's run it and examine ALL output for debugging
-        full_cmd = f"{' '.join(cmd)} < {tmp_name}"
-        print(f"DEBUG: Full command: {full_cmd}")
+        # Run the command with a timeout
+        try:
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10
+            )
+            
+            # Clean up temporary input file
+            os.unlink(tmp_path)
 
-        result = subprocess.run(
-            full_cmd,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
+            # Check if the file was created successfully
+            if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+                if not quiet:
+                    print(f"  Successfully created WAV file: {output_file}")
+                return True
+            else:
+                print(f"ERROR: Failed to create WAV file: {output_file}")
+                if not quiet:
+                    print(f"  Command: {cmd}")
+                    print(f"  Return code: {result.returncode}")
+                    print(f"  STDOUT: {result.stdout.decode('utf-8', errors='replace')}")
+                    print(f"  STDERR: {result.stderr.decode('utf-8', errors='replace')}")
+                return False
 
-        # Print ALL output for debugging
-        print(f"DEBUG: Return code: {result.returncode}")
-        print(f"DEBUG: STDOUT: {result.stdout}")
-        print(f"DEBUG: STDERR: {result.stderr}")
-
-        # Check if the file was created successfully
-        if os.path.exists(output_file):
-            print(f"DEBUG: Successfully created output file: {output_file}")
-            os.unlink(tmp_name)  # Clean up temporary file
-            return True
-        else:
-            print(f"ERROR: Failed to create WAV file: {output_file}")
-            os.unlink(tmp_name)  # Clean up temporary file
+        except Exception as e:
+            print(f"ERROR processing chunk: {e}")
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
             return False
-
+            
     except Exception as e:
         print(f"EXCEPTION: {e}")
         return False
 
+def generate_wav_for_chunk_with_module(chunk, output_file, protocol=5, volume=50, sample_rate=48000, quiet=False, timeout=30):
+    """Generate a WAV file for a chunk using ggwave Python module."""
+    
+    if not quiet:
+        print(f"  Processing chunk with {len(chunk)} characters using Python module")
+        print(f"  Encoding audio with protocol {protocol}, volume {volume}...")
+    
+    try:
+        import signal
+        import threading
+        
+        # Define a class to handle timeouts
+        class TimeoutError(Exception):
+            pass
+        
+        def timeout_handler(signum, frame):
+            raise TimeoutError("Audio encoding timed out")
+        
+        # Set a signal handler for timeout
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(timeout)
+        
+        start_time = time.time()
+        
+        # Generate audio waveform using ggwave
+        waveform = ggwave.encode(chunk, protocolId=protocol, volume=volume)
+        
+        # Reset the alarm
+        signal.alarm(0)
+        
+        encode_time = time.time() - start_time
+        if not quiet:
+            print(f"  Encoding completed in {encode_time:.2f} seconds")
+        
+        # Convert byte data into float32
+        waveform_float32 = np.frombuffer(waveform, dtype=np.float32)
+        
+        # Normalize the float32 data to the range of int16
+        waveform_int16 = np.int16(waveform_float32 * 32767)
+        
+        if not quiet:
+            print(f"  Writing WAV file...")
+        
+        # Save the waveform to a .wav file
+        with wave.open(output_file, "wb") as wf:
+            wf.setnchannels(1)                  # mono audio
+            wf.setsampwidth(2)                  # 2 bytes per sample (16-bit PCM)
+            wf.setframerate(sample_rate)        # sample rate
+            wf.writeframes(waveform_int16.tobytes())  # write the waveform as bytes
+            
+        # Check if the file was created successfully
+        if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+            if not quiet:
+                print(f"  Successfully created WAV file: {output_file}")
+            return True
+        else:
+            print(f"ERROR: Failed to create WAV file: {output_file}")
+            return False
+    
+    except TimeoutError:
+        print(f"ERROR: Audio encoding timed out after {timeout} seconds")
+        return False
+    except Exception as e:
+        print(f"EXCEPTION: {e}")
+        return False
+    finally:
+        # Make sure to reset the alarm
+        signal.alarm(0)
+
+def generate_wav_for_chunk(chunk, output_file, protocol=5, volume=50, sample_rate=48000, quiet=False, timeout=30):
+    """Generate a WAV file for a chunk using either the Python module or binary."""
+    if USE_GGWAVE_MODULE:
+        return generate_wav_for_chunk_with_module(chunk, output_file, protocol, volume, sample_rate, quiet, timeout)
+    else:
+        return generate_wav_for_chunk_with_binary(chunk, output_file, protocol, volume, sample_rate, quiet)
+
 def create_silence_wav(output_file, duration_seconds, sample_rate=48000):
     """Create a WAV file with silence."""
-    # Create a WAV file with silence (all zeros)
     n_channels = 1
     sample_width = 2  # 16-bit
     n_frames = int(duration_seconds * sample_rate)
@@ -144,57 +225,37 @@ def create_silence_wav(output_file, duration_seconds, sample_rate=48000):
         wav_file.setparams((n_channels, sample_width, sample_rate, n_frames, 'NONE', 'not compressed'))
         wav_file.writeframes(bytes(n_frames * sample_width))
 
-def combine_wav_files(wav_files, output_file):
-    """Combine multiple WAV files into one."""
-    data = []
-    params = None
-
-    # Read all WAV files
-    for wav_file in wav_files:
-        with wave.open(wav_file, 'rb') as wf:
-            if params is None:
-                params = wf.getparams()
-            data.append(wf.readframes(wf.getnframes()))
-
-    # Write combined WAV file
-    with wave.open(output_file, 'wb') as wf:
-        wf.setparams(params)
-        for frame_data in data:
-            wf.writeframes(frame_data)
-
-def create_video_from_wav(wav_file, video_file, image_path=None, url_text=None):
+def create_video_from_wav(wav_file, video_file, image_path=None, url_text="https://waver.ggerganov.com/"):
     """Create a video file from a WAV file."""
     try:
         # Check if ffmpeg is available
         try:
             subprocess.run(['ffmpeg', '-version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         except (subprocess.SubprocessError, FileNotFoundError):
-            print("Error: ffmpeg is not installed or not in PATH. Cannot create video.")
+            print("Warning: ffmpeg is not installed or not in PATH. Cannot create video.")
             return False
 
         # Create a temporary directory for working files
         temp_dir = tempfile.mkdtemp()
 
         try:
-            # If an image is provided, use it; otherwise, create a blank image with optional URL text
-            input_image = None
-            if image_path and os.path.exists(image_path):
-                input_image = image_path
-            else:
-                # Create a blank image with URL text if provided
-                blank_image_path = os.path.join(temp_dir, "blank.png")
-                url_text_option = ""
-                if url_text:
-                    url_text_option = f"-vf \"drawtext=text='{url_text}':fontcolor=white:fontsize=24:x=(w-text_w)/2:y=(h-text_h)/2\""
-
-                # Create a blank black image
-                subprocess.run(
-                    f"ffmpeg -f lavfi -i color=c=black:s=640x360:d=1 {url_text_option} -frames:v 1 {blank_image_path}",
-                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
+            # Create a blank image with URL text
+            blank_image_path = os.path.join(temp_dir, "blank.png")
+            url_text_option = ""
+            if url_text:
+                # Use a more complex drawtext filter to make the URL more visible
+                url_text_option = (
+                    f"drawtext=text='{url_text}':fontcolor=white:fontsize=36:box=1:"
+                    f"boxcolor=black@0.5:boxborderw=10:x=(w-text_w)/2:y=(h-text_h)/2"
                 )
-                input_image = blank_image_path
 
-            # Now create the video from the WAV file and the image
+            # Create a blank black image with URL
+            subprocess.run(
+                f"ffmpeg -f lavfi -i color=c=black:s=1280x720:d=1 "
+                f"-vf \"{url_text_option}\" -frames:v 1 {blank_image_path}",
+                shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
+            )
+
             # Get the duration of the WAV file
             with wave.open(wav_file, 'rb') as wf:
                 frames = wf.getnframes()
@@ -203,8 +264,8 @@ def create_video_from_wav(wav_file, video_file, image_path=None, url_text=None):
 
             # Create the video
             subprocess.run(
-                f"ffmpeg -loop 1 -i {input_image} -i {wav_file} -c:v libx264 -tune stillimage "
-                f"-c:a aac -b:a 192k -pix_fmt yuv420p -shortest -y {video_file}",
+                f"ffmpeg -loop 1 -i {blank_image_path} -i {wav_file} -c:v libx264 "
+                f"-tune stillimage -c:a aac -b:a 192k -pix_fmt yuv420p -shortest -y {video_file}",
                 shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
             )
 
@@ -224,15 +285,39 @@ def create_video_from_wav(wav_file, video_file, image_path=None, url_text=None):
         print(f"Error creating video: {e}")
         return False
 
-def process_large_message(message, output_file, protocol=1, volume=50, sample_rate=48000,
-                         add_pauses=True, pause_duration=PAUSE_SECONDS, quiet=False,
-                         create_video=False, image_path=None, url_text=None):
-    """Process a large message and create a WAV file and optionally a video file."""
+def combine_wav_files(wav_files, output_file):
+    """Combine multiple WAV files into one."""
+    data = []
+    params = None
+
+    # Read all WAV files
+    for wav_file in wav_files:
+        with wave.open(wav_file, 'rb') as wf:
+            if params is None:
+                params = wf.getparams()
+            data.append(wf.readframes(wf.getnframes()))
+
+    # Write combined WAV file
+    with wave.open(output_file, 'wb') as wf:
+        wf.setparams(params)
+        for frame_data in data:
+            wf.writeframes(frame_data)
+
+def process_large_message(message, output_file, protocol=5, volume=50, sample_rate=48000,
+                         add_pauses=True, pause_duration=1.0, quiet=False,
+                         create_video=True, image_path=None, url_text="https://waver.ggerganov.com/",
+                         timeout=30):
+    """Process a large message and create a WAV/video file."""
 
     # Split the message into chunks
     chunks = split_message(message, CHUNK_SIZE)
     if not quiet:
         print(f"Split message into {len(chunks)} chunks")
+
+    # Determine output files
+    base_output = os.path.splitext(output_file)[0]
+    wav_output = output_file if not create_video else f"{base_output}_temp.wav"
+    video_output = f"{base_output}.mp4" if create_video else None
 
     # Create temporary directory for chunk WAVs
     temp_dir = tempfile.mkdtemp()
@@ -245,8 +330,9 @@ def process_large_message(message, output_file, protocol=1, volume=50, sample_ra
             chunk_files.append(chunk_file)
 
             if not quiet:
-                print(f"Processing chunk {i+1}/{len(chunks)}: {chunk}")
-            success = generate_wav_for_chunk(chunk, chunk_file, protocol, volume, sample_rate, quiet)
+                print(f"Processing chunk {i+1}/{len(chunks)}: {len(chunk)} characters")
+
+            success = generate_wav_for_chunk(chunk, chunk_file, protocol, volume, sample_rate, quiet, timeout)
 
             if not success:
                 print(f"Failed to process chunk {i+1}")
@@ -265,20 +351,28 @@ def process_large_message(message, output_file, protocol=1, volume=50, sample_ra
                     interleaved_files.append(silence_file)
 
             # Combine all files
-            combine_wav_files(interleaved_files, output_file)
+            combine_wav_files(interleaved_files, wav_output)
         else:
             # Just combine all chunks without pauses
-            combine_wav_files(chunk_files, output_file)
+            combine_wav_files(chunk_files, wav_output)
 
         if not quiet:
-            print(f"Successfully created WAV file: {output_file}")
+            print(f"Successfully created WAV file: {wav_output}")
 
         # Create video if requested
         if create_video:
-            # Get the base output name without extension
-            base_output = os.path.splitext(output_file)[0]
-            video_file = f"{base_output}.mp4"
-            create_video_from_wav(output_file, video_file, image_path, url_text)
+            video_success = create_video_from_wav(wav_output, video_output, image_path, url_text)
+
+            if video_success:
+                # Remove the temporary WAV file if video was successfully created
+                if os.path.exists(wav_output) and wav_output != output_file:
+                    os.unlink(wav_output)
+            else:
+                print("Warning: Failed to create video, WAV file preserved")
+
+                # If video creation failed but we want video output, rename the WAV to match the requested output
+                if wav_output != output_file:
+                    os.rename(wav_output, output_file)
 
         return True
 
@@ -304,33 +398,34 @@ def list_protocols():
     print("\nAvailable Protocols:")
     print("-------------------")
     for protocol in PROTOCOLS:
-        print(f"{protocol['id']:2d} - {protocol['name']:<15} : {protocol['desc']}")
+        default_marker = " (DEFAULT)" if protocol['id'] == 5 else ""
+        print(f"{protocol['id']:2d} - {protocol['name']:<15} : {protocol['desc']}{default_marker}")
     print("\nUsage Examples:")
     print("--------------")
     print("  Default (Ultrasound Fastest): ./ggwave_large_message.py -i message.txt")
     print("  Fast audible mode:            ./ggwave_large_message.py -i message.txt -p 1")
-    print("  Audio only (no video):        ./ggwave_large_message.py -i message.txt --no-video")
+    print("  WAV output (no video):        ./ggwave_large_message.py -i message.txt --no-video")
     print("  Custom URL in video:          ./ggwave_large_message.py -i message.txt --url \"https://example.com/\"")
+    print("  Custom volume:                ./ggwave_large_message.py -i message.txt -v 75")
     print("  Less verbose output:          ./ggwave_large_message.py -i message.txt --quiet")
     print("  Longer pauses between chunks: ./ggwave_large_message.py -i message.txt -d 2.0")
     print()
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert a large message to a WAV/video file using ggwave")
+    parser = argparse.ArgumentParser(description="Convert a large message to a WAV or MP4 file using ggwave")
     parser.add_argument("--input", "-i", help="Input text file (if not provided, will read from stdin)")
-    parser.add_argument("--output", "-o", default="output.wav", help="Output WAV file (default: output.wav)")
+    parser.add_argument("--output", "-o", default="output.wav", help="Output file base name (default: output.wav)")
     parser.add_argument("--protocol", "-p", type=int, default=5, help="Protocol ID (default: 5, '[U] Fastest' - see --list-protocols)")
     parser.add_argument("--volume", "-v", type=int, default=50, help="Volume (default: 50)")
     parser.add_argument("--sample-rate", "-s", type=int, default=48000, help="Sample rate (default: 48000)")
     parser.add_argument("--no-pauses", action="store_true", help="Don't add pauses between chunks")
-    parser.add_argument("--pause-duration", "-d", type=float, default=PAUSE_SECONDS,
-                        help=f"Pause duration in seconds (default: {PAUSE_SECONDS})")
+    parser.add_argument("--pause-duration", "-d", type=float, default=1.0,
+                        help=f"Pause duration in seconds (default: 1.0)")
     parser.add_argument("--quiet", "-q", action="store_true", help="Less verbose output")
     parser.add_argument("--list-protocols", "-l", action="store_true", help="List available protocols and exit")
-    parser.add_argument("--no-video", action="store_true", help="Do not create a video file (video is generated by default)")
-    parser.add_argument("--image", help="Image file to use for video (if not provided, a blank image will be used)")
-    parser.add_argument("--url", default="https://waver.ggerganov.com/",
-                       help="URL to display in the video (default: https://waver.ggerganov.com/)")
+    parser.add_argument("--no-video", action="store_true", help="Output WAV file instead of MP4 video (video is default)")
+    parser.add_argument("--url", help="URL to display in the video (default: https://waver.ggerganov.com/)")
+    parser.add_argument("--timeout", "-t", type=int, default=30, help="Timeout in seconds for audio encoding (default: 30)")
 
     args = parser.parse_args()
 
@@ -358,6 +453,11 @@ def main():
 
     if not args.quiet:
         print(f"Using protocol: {args.protocol} ({protocol_name})")
+        output_type = "WAV audio" if args.no_video else "MP4 video"
+        print(f"Output type: {output_type}")
+
+    # URL to display in the video
+    url_text = args.url if args.url else "https://waver.ggerganov.com/"
 
     # Process the message
     success = process_large_message(
@@ -369,9 +469,10 @@ def main():
         not args.no_pauses,
         args.pause_duration,
         args.quiet,
-        not args.no_video,  # Default to generating video unless --no-video is specified
-        args.image,
-        args.url if not args.no_video else None
+        not args.no_video,  # create_video (default to True)
+        None,               # image_path
+        url_text,           # URL to display
+        args.timeout        # timeout for encoding
     )
 
     sys.exit(0 if success else 1)
